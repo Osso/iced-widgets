@@ -5,7 +5,7 @@ use iced::advanced::{Clipboard, Shell, Widget};
 use iced::keyboard::{self, key::Named};
 use iced::mouse::{self, Cursor};
 use iced::widget::scrollable::Scrollable;
-use iced::widget::{container, Column};
+use iced::widget::{Column, container};
 use iced::{Element, Event, Length, Rectangle, Size, Theme};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -152,9 +152,8 @@ impl State {
 
     /// Relative position of selected element to first visible (in items, not pixels)
     fn selected_relative_to_visible(&self, item_height: f32) -> Option<isize> {
-        self.selected.map(|sel| {
-            sel as isize - self.first_visible_index(item_height) as isize
-        })
+        self.selected
+            .map(|sel| sel as isize - self.first_visible_index(item_height) as isize)
     }
 
     /// Number of fully visible elements
@@ -217,7 +216,13 @@ impl State {
         if result.is_some() {
             eprintln!(
                 "[scroll] index={} item_top={:.0} item_bottom={:.0} scroll_y={:.0} viewport_h={:.0} viewport_bottom={:.0} -> scroll_to={:?}",
-                index, item_top, item_bottom, scroll_y, self.viewport_height, viewport_bottom, result
+                index,
+                item_top,
+                item_bottom,
+                scroll_y,
+                self.viewport_height,
+                viewport_bottom,
+                result
             );
         }
 
@@ -323,6 +328,7 @@ where
                 container((self.view)(item, is_selected))
                     .width(Length::Fill)
                     .height(Length::Fixed(self.item_height))
+                    .clip(true)
                     .into()
             })
             .collect();
@@ -342,10 +348,9 @@ where
             tree.children[0].diff(&scrollable);
         }
 
-        let node =
-            scrollable
-                .as_widget_mut()
-                .layout(&mut tree.children[0], renderer, limits);
+        let node = scrollable
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
 
         // Update viewport height for page calculations
         state.viewport_height = node.bounds().height;
@@ -377,6 +382,7 @@ where
                 container((self.view)(item, is_selected))
                     .width(Length::Fill)
                     .height(Length::Fixed(self.item_height))
+                    .clip(true)
                     .into()
             })
             .collect();
@@ -428,10 +434,26 @@ where
             }
         }
 
+        // Track scroll wheel events to keep our offset in sync
+        if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
+            if cursor.is_over(bounds) {
+                let content_height = self.items.len() as f32 * self.item_height;
+                let max_scroll = (content_height - bounds.height).max(0.0);
+
+                let delta_y = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => -y * 20.0, // ~20px per line
+                    mouse::ScrollDelta::Pixels { y, .. } => -y,
+                };
+
+                let current = state.scroll_offset_y();
+                let new_offset = (current + delta_y).clamp(0.0, max_scroll);
+                state.set_scroll_offset_y(new_offset);
+            }
+        }
+
         // Handle mouse clicks to select items
         if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
             if let Some(pos) = cursor.position_in(bounds) {
-                // Calculate which item was clicked based on scroll position and click Y
                 let scroll_y = state.scroll_offset_y();
                 let click_y = pos.y + scroll_y;
                 let clicked_index = (click_y / self.item_height) as usize;
@@ -519,6 +541,7 @@ where
                 container((self.view)(item, is_selected))
                     .width(Length::Fill)
                     .height(Length::Fixed(self.item_height))
+                    .clip(true)
                     .into()
             })
             .collect();
@@ -565,6 +588,7 @@ where
                 container((self.view)(item, is_selected))
                     .width(Length::Fill)
                     .height(Length::Fixed(self.item_height))
+                    .clip(true)
                     .into()
             })
             .collect();
@@ -577,9 +601,13 @@ where
             .height(Length::Fill)
             .into();
 
-        scrollable
-            .as_widget()
-            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+        scrollable.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
     }
 
     fn operate(
@@ -601,6 +629,7 @@ where
                 container((self.view)(item, is_selected))
                     .width(Length::Fill)
                     .height(Length::Fixed(self.item_height))
+                    .clip(true)
                     .into()
             })
             .collect();
