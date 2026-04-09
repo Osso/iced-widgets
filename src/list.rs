@@ -2,7 +2,7 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer;
 use iced::advanced::widget::{self, Operation, Tree};
 use iced::advanced::{Clipboard, Shell, Widget};
-use iced::keyboard::{self, key::Named};
+use iced::keyboard;
 use iced::mouse::{self, Cursor};
 use iced::widget::scrollable::Scrollable;
 use iced::widget::{Column, container};
@@ -420,55 +420,32 @@ where
         let state = tree.state.downcast_mut::<State>();
         let bounds = layout.bounds();
 
-        // Detect external selection changes and scroll into view
         if let Some(ext_sel) = self.external_selected {
-            if state.last_scrolled_to != Some(ext_sel) {
-                state.last_scrolled_to = Some(ext_sel);
-                state.selected = Some(ext_sel);
-                if let Some(new_scroll_y) = state.scroll_into_view(ext_sel, self.item_height) {
-                    state.set_scroll_offset_y(new_scroll_y);
-                    if let Some(on_scroll_to) = &self.on_scroll_to {
-                        shell.publish(on_scroll_to(new_scroll_y));
-                    }
-                }
-            }
+            sync_external_selection(state, ext_sel, self.item_height, &self.on_scroll_to, shell);
         }
 
-        // Track scroll wheel events to keep our offset in sync
         if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
             if cursor.is_over(bounds) {
-                let content_height = self.items.len() as f32 * self.item_height;
-                let max_scroll = (content_height - bounds.height).max(0.0);
-
-                let delta_y = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => -y * 20.0, // ~20px per line
-                    mouse::ScrollDelta::Pixels { y, .. } => -y,
-                };
-
-                let current = state.scroll_offset_y();
-                let new_offset = (current + delta_y).clamp(0.0, max_scroll);
-                state.set_scroll_offset_y(new_offset);
+                handle_wheel_scroll(
+                    state,
+                    delta,
+                    self.items.len(),
+                    self.item_height,
+                    bounds.height,
+                );
             }
         }
 
-        // Handle mouse clicks to select items
         if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
             if let Some(pos) = cursor.position_in(bounds) {
-                let scroll_y = state.scroll_offset_y();
-                let click_y = pos.y + scroll_y;
-                let clicked_index = (click_y / self.item_height) as usize;
-
-                if clicked_index < self.items.len() {
-                    let old_selected = state.selected;
-                    state.selected = Some(clicked_index);
-
-                    if state.selected != old_selected {
-                        // Emit selection change callback
-                        if let Some(on_select) = &self.on_select {
-                            shell.publish(on_select(clicked_index));
-                        }
-                    }
-
+                if handle_mouse_click(
+                    state,
+                    pos.y,
+                    self.items.len(),
+                    self.item_height,
+                    &self.on_select,
+                    shell,
+                ) {
                     shell.capture_event();
                     shell.request_redraw();
                     return;
@@ -476,54 +453,17 @@ where
             }
         }
 
-        // Handle keyboard events when cursor is over the list
         if cursor.is_over(bounds) {
             if let Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = event {
-                let old_selected = state.selected;
-                let mut handled = true;
-
-                match key {
-                    keyboard::Key::Named(Named::ArrowUp) => state.select_previous(),
-                    keyboard::Key::Named(Named::ArrowDown) => state.select_next(),
-                    keyboard::Key::Named(Named::PageUp) => state.page_up(self.item_height),
-                    keyboard::Key::Named(Named::PageDown) => state.page_down(self.item_height),
-                    keyboard::Key::Named(Named::Home) => state.select_first(),
-                    keyboard::Key::Named(Named::End) => state.select_last(),
-                    keyboard::Key::Named(Named::Enter) => {
-                        if let (Some(selected), Some(on_activate)) =
-                            (state.selected, &self.on_activate)
-                        {
-                            shell.publish(on_activate(selected));
-                        }
-                    }
-                    _ => handled = false,
-                }
-
-                if handled {
-                    // Handle selection change
-                    if state.selected != old_selected {
-                        if let Some(new_index) = state.selected {
-                            // Check if we need to scroll to keep selection visible
-                            if let Some(new_scroll_y) =
-                                state.scroll_into_view(new_index, self.item_height)
-                            {
-                                state.set_scroll_offset_y(new_scroll_y);
-                                if let Some(on_scroll_to) = &self.on_scroll_to {
-                                    shell.publish(on_scroll_to(new_scroll_y));
-                                }
-                            }
-                        }
-
-                        // Debug dump on every selection change
-                        eprintln!("[list] {}", state.dump(self.item_height));
-
-                        // Emit selection change callback
-                        if let (Some(selected), Some(on_select)) = (state.selected, &self.on_select)
-                        {
-                            shell.publish(on_select(selected));
-                        }
-                    }
-
+                if handle_keyboard_nav(
+                    state,
+                    key,
+                    self.item_height,
+                    &self.on_activate,
+                    &self.on_scroll_to,
+                    &self.on_select,
+                    shell,
+                ) {
                     shell.capture_event();
                     shell.request_redraw();
                     return;
@@ -531,7 +471,6 @@ where
             }
         }
 
-        // Forward other events to the scrollable
         let items: Vec<Element<'_, Message>> = self
             .items
             .iter()
@@ -548,8 +487,6 @@ where
 
         let content: Element<'_, Message> = Column::with_children(items).width(Length::Fill).into();
 
-        // Build scrollable without on_scroll to avoid widget inconsistency issues
-        // The scroll offset will be synced via scroll_into_view calculations
         let mut scrollable: Element<'_, Message> = Scrollable::new(content)
             .id(self.id.clone())
             .width(Length::Fill)
@@ -646,6 +583,116 @@ where
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
     }
+}
+
+fn sync_external_selection<'a, Message: Clone + 'a>(
+    state: &mut State,
+    ext_sel: usize,
+    item_height: f32,
+    on_scroll_to: &Option<Rc<dyn Fn(f32) -> Message + 'a>>,
+    shell: &mut Shell<'_, Message>,
+) {
+    if state.last_scrolled_to == Some(ext_sel) {
+        return;
+    }
+    state.last_scrolled_to = Some(ext_sel);
+    state.selected = Some(ext_sel);
+    if let Some(new_scroll_y) = state.scroll_into_view(ext_sel, item_height) {
+        state.set_scroll_offset_y(new_scroll_y);
+        if let Some(on_scroll_to) = on_scroll_to {
+            shell.publish(on_scroll_to(new_scroll_y));
+        }
+    }
+}
+
+fn handle_wheel_scroll(
+    state: &mut State,
+    delta: &mouse::ScrollDelta,
+    item_count: usize,
+    item_height: f32,
+    viewport_height: f32,
+) {
+    let content_height = item_count as f32 * item_height;
+    let max_scroll = (content_height - viewport_height).max(0.0);
+    let delta_y = match delta {
+        mouse::ScrollDelta::Lines { y, .. } => -y * 20.0,
+        mouse::ScrollDelta::Pixels { y, .. } => -y,
+    };
+    let new_offset = (state.scroll_offset_y() + delta_y).clamp(0.0, max_scroll);
+    state.set_scroll_offset_y(new_offset);
+}
+
+fn handle_mouse_click<'a, Message: Clone + 'a>(
+    state: &mut State,
+    click_y_in_bounds: f32,
+    item_count: usize,
+    item_height: f32,
+    on_select: &Option<Box<dyn Fn(usize) -> Message + 'a>>,
+    shell: &mut Shell<'_, Message>,
+) -> bool {
+    let click_y = click_y_in_bounds + state.scroll_offset_y();
+    let clicked_index = (click_y / item_height) as usize;
+    if clicked_index >= item_count {
+        return false;
+    }
+    let old_selected = state.selected;
+    state.selected = Some(clicked_index);
+    if state.selected != old_selected {
+        if let Some(on_select) = on_select {
+            shell.publish(on_select(clicked_index));
+        }
+    }
+    true
+}
+
+fn handle_keyboard_nav<'a, Message: Clone + 'a>(
+    state: &mut State,
+    key: &iced::keyboard::Key,
+    item_height: f32,
+    on_activate: &Option<Box<dyn Fn(usize) -> Message + 'a>>,
+    on_scroll_to: &Option<Rc<dyn Fn(f32) -> Message + 'a>>,
+    on_select: &Option<Box<dyn Fn(usize) -> Message + 'a>>,
+    shell: &mut Shell<'_, Message>,
+) -> bool {
+    use iced::keyboard::key::Named;
+    let old_selected = state.selected;
+    let mut handled = true;
+
+    match key {
+        keyboard::Key::Named(Named::ArrowUp) => state.select_previous(),
+        keyboard::Key::Named(Named::ArrowDown) => state.select_next(),
+        keyboard::Key::Named(Named::PageUp) => state.page_up(item_height),
+        keyboard::Key::Named(Named::PageDown) => state.page_down(item_height),
+        keyboard::Key::Named(Named::Home) => state.select_first(),
+        keyboard::Key::Named(Named::End) => state.select_last(),
+        keyboard::Key::Named(Named::Enter) => {
+            if let (Some(selected), Some(on_activate)) = (state.selected, on_activate) {
+                shell.publish(on_activate(selected));
+            }
+        }
+        _ => handled = false,
+    }
+
+    if handled {
+        if state.selected != old_selected {
+            if let Some(new_index) = state.selected {
+                if let Some(new_scroll_y) = state.scroll_into_view(new_index, item_height) {
+                    state.set_scroll_offset_y(new_scroll_y);
+                    if let Some(on_scroll_to) = on_scroll_to {
+                        shell.publish(on_scroll_to(new_scroll_y));
+                    }
+                }
+            }
+
+            eprintln!("[list] {}", state.dump(item_height));
+
+            if let (Some(selected), Some(on_select)) = (state.selected, on_select) {
+                shell.publish(on_select(selected));
+            }
+        }
+    }
+
+    handled
 }
 
 impl<'a, T, Message> From<List<'a, T, Message>> for Element<'a, Message>
