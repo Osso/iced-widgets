@@ -69,13 +69,7 @@ where
 
     /// Sets the callback when scrolling is needed to keep selection visible.
     ///
-    /// The callback receives the target Y scroll offset. Use with `scrollable::scroll_to`:
-    /// ```ignore
-    /// .on_scroll_to(|y| Message::ScrollList(y))
-    ///
-    /// // In update():
-    /// Message::ScrollList(y) => scrollable::scroll_to(list_id, AbsoluteOffset { x: 0.0, y })
-    /// ```
+    /// The callback receives the target Y scroll offset.
     pub fn on_scroll_to(mut self, f: impl Fn(f32) -> Message + 'a) -> Self {
         self.on_scroll_to = Some(Rc::new(f));
         self
@@ -112,6 +106,143 @@ where
     pub fn selected(mut self, index: Option<usize>) -> Self {
         self.external_selected = index;
         self
+    }
+
+    fn current_selection(&self, state: &State) -> Option<usize> {
+        self.external_selected.or(state.selected)
+    }
+
+    fn sync_layout_state(&self, state: &mut State) {
+        state.item_count = self.items.len();
+
+        // Controlled mode overrides internal selection.
+        if self.external_selected.is_some() {
+            state.selected = self.external_selected;
+        }
+    }
+
+    fn build_item_elements(&self, selected: Option<usize>) -> Vec<Element<'a, Message>> {
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let is_selected = selected == Some(i);
+                container((self.view)(item, is_selected))
+                    .width(Length::Fill)
+                    .height(Length::Fixed(self.item_height))
+                    .clip(true)
+                    .into()
+            })
+            .collect()
+    }
+
+    fn build_scrollable(&self, selected: Option<usize>) -> Element<'a, Message> {
+        let content: Element<'a, Message> =
+            Column::with_children(self.build_item_elements(selected))
+                .width(Length::Fill)
+                .into();
+
+        Scrollable::new(content)
+            .id(self.id.clone())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn ensure_scrollable_child(tree: &mut Tree, scrollable: &Element<'_, Message>) {
+        if tree.children.is_empty() {
+            tree.children.push(Tree::new(scrollable));
+            return;
+        }
+
+        tree.children[0].diff(scrollable);
+    }
+
+    fn sync_external_selection_if_needed(&self, state: &mut State, shell: &mut Shell<'_, Message>) {
+        let Some(ext_sel) = self.external_selected else {
+            return;
+        };
+
+        sync_external_selection(state, ext_sel, self.item_height, &self.on_scroll_to, shell);
+    }
+
+    fn apply_wheel_scroll_if_over(
+        &self,
+        event: &Event,
+        cursor: Cursor,
+        bounds: Rectangle,
+        state: &mut State,
+    ) {
+        let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event else {
+            return;
+        };
+        if !cursor.is_over(bounds) {
+            return;
+        }
+
+        handle_wheel_scroll(
+            state,
+            delta,
+            self.items.len(),
+            self.item_height,
+            bounds.height,
+        );
+    }
+
+    fn handle_mouse_press(
+        &self,
+        event: &Event,
+        cursor: Cursor,
+        bounds: Rectangle,
+        state: &mut State,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
+        let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else {
+            return false;
+        };
+        let Some(pos) = cursor.position_in(bounds) else {
+            return false;
+        };
+
+        handle_mouse_click(
+            state,
+            pos.y,
+            self.items.len(),
+            self.item_height,
+            &self.on_select,
+            shell,
+        )
+    }
+
+    fn handle_key_press(
+        &self,
+        event: &Event,
+        cursor: Cursor,
+        bounds: Rectangle,
+        state: &mut State,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
+        if !cursor.is_over(bounds) {
+            return false;
+        }
+        let Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = event else {
+            return false;
+        };
+
+        handle_keyboard_nav(
+            state,
+            key,
+            self.item_height,
+            &self.on_activate,
+            &self.on_scroll_to,
+            &self.on_select,
+            shell,
+        )
+    }
+
+    fn consume_event(shell: &mut Shell<'_, Message>) {
+        shell.capture_event();
+        shell.request_redraw();
     }
 }
 
@@ -293,71 +424,40 @@ where
     }
 
     fn children(&self) -> Vec<Tree> {
-        // No initial children - layout() will create the scrollable tree
         Vec::new()
     }
 
     fn diff(&self, tree: &mut Tree) {
-        // Preserve first child (scrollable tree), clear any extras
-        // Don't add Tree::empty() here - layout() will create with correct tag
         tree.children.truncate(1);
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn layout(
         &mut self,
         tree: &mut Tree,
         renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let state = tree.state.downcast_mut::<State>();
-        state.item_count = self.items.len();
-
-        // Sync external selection
-        if self.external_selected.is_some() {
-            state.selected = self.external_selected;
+        {
+            let state = tree.state.downcast_mut::<State>();
+            self.sync_layout_state(state);
         }
 
-        // Use external selection if provided, otherwise internal
-        let selected = self.external_selected.or(state.selected);
-        let items: Vec<Element<'_, Message>> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_selected = selected == Some(i);
-                container((self.view)(item, is_selected))
-                    .width(Length::Fill)
-                    .height(Length::Fixed(self.item_height))
-                    .clip(true)
-                    .into()
-            })
-            .collect();
-
-        let content: Element<'_, Message> = Column::with_children(items).width(Length::Fill).into();
-
-        let mut scrollable: Element<'_, Message> = Scrollable::new(content)
-            .id(self.id.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-
-        // Create child tree for the scrollable
-        if tree.children.is_empty() {
-            tree.children.push(Tree::new(&scrollable));
-        } else {
-            tree.children[0].diff(&scrollable);
-        }
-
+        let selected = {
+            let state = tree.state.downcast_ref::<State>();
+            self.current_selection(state)
+        };
+        let mut scrollable = self.build_scrollable(selected);
+        Self::ensure_scrollable_child(tree, &scrollable);
         let node = scrollable
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits);
 
-        // Update viewport height for page calculations
-        state.viewport_height = node.bounds().height;
-
+        tree.state.downcast_mut::<State>().viewport_height = node.bounds().height;
         node
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn draw(
         &self,
         tree: &Tree,
@@ -369,31 +469,8 @@ where
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<State>();
-        // Use external selection if provided, otherwise internal
-        let selected = self.external_selected.or(state.selected);
-
-        // Rebuild items for drawing
-        let items: Vec<Element<'_, Message>> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_selected = selected == Some(i);
-                container((self.view)(item, is_selected))
-                    .width(Length::Fill)
-                    .height(Length::Fixed(self.item_height))
-                    .clip(true)
-                    .into()
-            })
-            .collect();
-
-        let content: Element<'_, Message> = Column::with_children(items).width(Length::Fill).into();
-
-        let scrollable: Element<'_, Message> = Scrollable::new(content)
-            .id(self.id.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        let selected = self.current_selection(state);
+        let scrollable = self.build_scrollable(selected);
 
         scrollable.as_widget().draw(
             &tree.children[0],
@@ -406,6 +483,7 @@ where
         );
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -420,78 +498,19 @@ where
         let state = tree.state.downcast_mut::<State>();
         let bounds = layout.bounds();
 
-        if let Some(ext_sel) = self.external_selected {
-            sync_external_selection(state, ext_sel, self.item_height, &self.on_scroll_to, shell);
+        self.sync_external_selection_if_needed(state, shell);
+        self.apply_wheel_scroll_if_over(event, cursor, bounds, state);
+
+        if self.handle_mouse_press(event, cursor, bounds, state, shell) {
+            Self::consume_event(shell);
+            return;
+        }
+        if self.handle_key_press(event, cursor, bounds, state, shell) {
+            Self::consume_event(shell);
+            return;
         }
 
-        if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
-            if cursor.is_over(bounds) {
-                handle_wheel_scroll(
-                    state,
-                    delta,
-                    self.items.len(),
-                    self.item_height,
-                    bounds.height,
-                );
-            }
-        }
-
-        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
-            if let Some(pos) = cursor.position_in(bounds) {
-                if handle_mouse_click(
-                    state,
-                    pos.y,
-                    self.items.len(),
-                    self.item_height,
-                    &self.on_select,
-                    shell,
-                ) {
-                    shell.capture_event();
-                    shell.request_redraw();
-                    return;
-                }
-            }
-        }
-
-        if cursor.is_over(bounds) {
-            if let Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = event {
-                if handle_keyboard_nav(
-                    state,
-                    key,
-                    self.item_height,
-                    &self.on_activate,
-                    &self.on_scroll_to,
-                    &self.on_select,
-                    shell,
-                ) {
-                    shell.capture_event();
-                    shell.request_redraw();
-                    return;
-                }
-            }
-        }
-
-        let items: Vec<Element<'_, Message>> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_selected = state.selected == Some(i);
-                container((self.view)(item, is_selected))
-                    .width(Length::Fill)
-                    .height(Length::Fixed(self.item_height))
-                    .clip(true)
-                    .into()
-            })
-            .collect();
-
-        let content: Element<'_, Message> = Column::with_children(items).width(Length::Fill).into();
-
-        let mut scrollable: Element<'_, Message> = Scrollable::new(content)
-            .id(self.id.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        let mut scrollable = self.build_scrollable(state.selected);
 
         scrollable.as_widget_mut().update(
             &mut tree.children[0],
@@ -505,6 +524,7 @@ where
         );
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn mouse_interaction(
         &self,
         tree: &Tree,
@@ -514,29 +534,8 @@ where
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         let state = tree.state.downcast_ref::<State>();
-        let selected = self.external_selected.or(state.selected);
-
-        let items: Vec<Element<'_, Message>> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_selected = selected == Some(i);
-                container((self.view)(item, is_selected))
-                    .width(Length::Fill)
-                    .height(Length::Fixed(self.item_height))
-                    .clip(true)
-                    .into()
-            })
-            .collect();
-
-        let content: Element<'_, Message> = Column::with_children(items).width(Length::Fill).into();
-
-        let scrollable: Element<'_, Message> = Scrollable::new(content)
-            .id(self.id.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        let selected = self.current_selection(state);
+        let scrollable = self.build_scrollable(selected);
 
         scrollable.as_widget().mouse_interaction(
             &tree.children[0],
@@ -547,6 +546,7 @@ where
         )
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn operate(
         &mut self,
         tree: &mut Tree,
@@ -555,29 +555,8 @@ where
         operation: &mut dyn Operation,
     ) {
         let state = tree.state.downcast_ref::<State>();
-        let selected = self.external_selected.or(state.selected);
-
-        let items: Vec<Element<'_, Message>> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_selected = selected == Some(i);
-                container((self.view)(item, is_selected))
-                    .width(Length::Fill)
-                    .height(Length::Fixed(self.item_height))
-                    .clip(true)
-                    .into()
-            })
-            .collect();
-
-        let content: Element<'_, Message> = Column::with_children(items).width(Length::Fill).into();
-
-        let mut scrollable: Element<'_, Message> = Scrollable::new(content)
-            .id(self.id.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        let selected = self.current_selection(state);
+        let mut scrollable = self.build_scrollable(selected);
 
         scrollable
             .as_widget_mut()
@@ -654,45 +633,103 @@ fn handle_keyboard_nav<'a, Message: Clone + 'a>(
     on_select: &Option<Box<dyn Fn(usize) -> Message + 'a>>,
     shell: &mut Shell<'_, Message>,
 ) -> bool {
-    use iced::keyboard::key::Named;
     let old_selected = state.selected;
-    let mut handled = true;
+    let Some(action) = keyboard_action(key) else {
+        return false;
+    };
+
+    match action {
+        KeyboardAction::Move(movement) => apply_keyboard_movement(state, movement, item_height),
+        KeyboardAction::Activate => publish_activation(state.selected, on_activate, shell),
+    }
+
+    if state.selected != old_selected {
+        publish_selection_change(state, item_height, on_scroll_to, on_select, shell);
+    }
+
+    true
+}
+
+#[derive(Clone, Copy)]
+enum KeyboardAction {
+    Move(KeyboardMovement),
+    Activate,
+}
+
+#[derive(Clone, Copy)]
+enum KeyboardMovement {
+    Previous,
+    Next,
+    PageUp,
+    PageDown,
+    First,
+    Last,
+}
+
+fn keyboard_action(key: &iced::keyboard::Key) -> Option<KeyboardAction> {
+    use iced::keyboard::key::Named;
 
     match key {
-        keyboard::Key::Named(Named::ArrowUp) => state.select_previous(),
-        keyboard::Key::Named(Named::ArrowDown) => state.select_next(),
-        keyboard::Key::Named(Named::PageUp) => state.page_up(item_height),
-        keyboard::Key::Named(Named::PageDown) => state.page_down(item_height),
-        keyboard::Key::Named(Named::Home) => state.select_first(),
-        keyboard::Key::Named(Named::End) => state.select_last(),
-        keyboard::Key::Named(Named::Enter) => {
-            if let (Some(selected), Some(on_activate)) = (state.selected, on_activate) {
-                shell.publish(on_activate(selected));
-            }
+        keyboard::Key::Named(Named::ArrowUp) => {
+            Some(KeyboardAction::Move(KeyboardMovement::Previous))
         }
-        _ => handled = false,
+        keyboard::Key::Named(Named::ArrowDown) => {
+            Some(KeyboardAction::Move(KeyboardMovement::Next))
+        }
+        keyboard::Key::Named(Named::PageUp) => Some(KeyboardAction::Move(KeyboardMovement::PageUp)),
+        keyboard::Key::Named(Named::PageDown) => {
+            Some(KeyboardAction::Move(KeyboardMovement::PageDown))
+        }
+        keyboard::Key::Named(Named::Home) => Some(KeyboardAction::Move(KeyboardMovement::First)),
+        keyboard::Key::Named(Named::End) => Some(KeyboardAction::Move(KeyboardMovement::Last)),
+        keyboard::Key::Named(Named::Enter) => Some(KeyboardAction::Activate),
+        _ => None,
+    }
+}
+
+fn apply_keyboard_movement(state: &mut State, movement: KeyboardMovement, item_height: f32) {
+    match movement {
+        KeyboardMovement::Previous => state.select_previous(),
+        KeyboardMovement::Next => state.select_next(),
+        KeyboardMovement::PageUp => state.page_up(item_height),
+        KeyboardMovement::PageDown => state.page_down(item_height),
+        KeyboardMovement::First => state.select_first(),
+        KeyboardMovement::Last => state.select_last(),
+    }
+}
+
+fn publish_activation<'a, Message: Clone + 'a>(
+    selected: Option<usize>,
+    on_activate: &Option<Box<dyn Fn(usize) -> Message + 'a>>,
+    shell: &mut Shell<'_, Message>,
+) {
+    if let (Some(selected), Some(on_activate)) = (selected, on_activate) {
+        shell.publish(on_activate(selected));
+    }
+}
+
+fn publish_selection_change<'a, Message: Clone + 'a>(
+    state: &mut State,
+    item_height: f32,
+    on_scroll_to: &Option<Rc<dyn Fn(f32) -> Message + 'a>>,
+    on_select: &Option<Box<dyn Fn(usize) -> Message + 'a>>,
+    shell: &mut Shell<'_, Message>,
+) {
+    let Some(new_index) = state.selected else {
+        return;
+    };
+
+    if let Some(new_scroll_y) = state.scroll_into_view(new_index, item_height) {
+        state.set_scroll_offset_y(new_scroll_y);
+        if let Some(on_scroll_to) = on_scroll_to {
+            shell.publish(on_scroll_to(new_scroll_y));
+        }
     }
 
-    if handled {
-        if state.selected != old_selected {
-            if let Some(new_index) = state.selected {
-                if let Some(new_scroll_y) = state.scroll_into_view(new_index, item_height) {
-                    state.set_scroll_offset_y(new_scroll_y);
-                    if let Some(on_scroll_to) = on_scroll_to {
-                        shell.publish(on_scroll_to(new_scroll_y));
-                    }
-                }
-            }
-
-            eprintln!("[list] {}", state.dump(item_height));
-
-            if let (Some(selected), Some(on_select)) = (state.selected, on_select) {
-                shell.publish(on_select(selected));
-            }
-        }
+    eprintln!("[list] {}", state.dump(item_height));
+    if let Some(on_select) = on_select {
+        shell.publish(on_select(new_index));
     }
-
-    handled
 }
 
 impl<'a, T, Message> From<List<'a, T, Message>> for Element<'a, Message>
@@ -704,3 +741,6 @@ where
         Element::new(list)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -5,6 +5,9 @@ edition = "2024"
 description = "High-level widgets for iced with keyboard navigation"
 license = "MIT"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
 [dependencies]
 iced = { version = "0.14", features = ["advanced"] }
 
@@ -13,4 +16,3 @@ iced = { version = "0.14", features = ["tiny-skia"] }
 
 [[example]]
 name = "list_demo"
-
